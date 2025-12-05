@@ -1,0 +1,28 @@
+/* App.css – Minimal für Tailwind Setup */
+
+/* Optional: globaler Container-Stil für deine App.jsx */
+.App {
+  /* Abstand innen */
+  padding: 1rem;
+
+  /* Hintergrund und Textfarbe – können auch als Tailwind-Klassen gesetzt werden */
+  background-color: #0f172a; /* entspricht bg-slate-900 */
+  color: #e2e8f0;           /* entspricht text-slate-200 */
+
+  /* Damit Inhalt den kompletten Fensterbereich nutzt */
+  min-height: 100vh;
+}
+
+/* Falls du z. B. Charts oder Sidebar extra stylen möchtest */
+.sidebar {
+  background-color: rgba(30, 41, 59, 0.5); /* bg-slate-900/50 */
+  border-right: 1px solid #1e293b;          /* border-slate-800 */
+  padding: 1rem;
+}
+
+.chart-container {
+  background-color: #1e293b; /* bg-slate-900 */
+  border: 1px solid #334155; /* border-slate-800 */
+  border-radius: 0.5rem; /* rounded-lg */
+  padding: 1rem;
+}
