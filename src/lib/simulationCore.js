@@ -1,231 +1,365 @@
 // simulationCore.js
-// Rotational wheel model — Edensity als J/m^2 (pro Kontaktfläche), realistischere Kühlung mittels h [W/m^2/K].
-// Export: simulationCore(params) => Array of samples
+// ------------------------------------------------------------
+// Dynamik:
+//   I_eff * dω/dt = τ_drive - τ_brake
+//   dθ/dt = ω
+//
+// I_eff = I_disc + mEff * R^2,  mEff = trainMass / nDrivenWheels (intern)
+//
+// Numerik:
+// - Substepping + exaktes Update im Substep.
+//
+// Thermik:
+// - pulseWheelSeq: Energie pro dt [J] (Rad-Anteil)
+// - 3D-Green im Halbraum (surfaceFactor=2), Singularitäts-Fix r^2 + a^2
+// - 2-Körper-Split via Effusivität oder heatSplitWheel
+// - kLoss als exp(-lambda * tau) im Kernel
+// ------------------------------------------------------------
 
 function fft_inplace(re, im, invert = false) {
   const n = re.length;
   let j = 0;
   for (let i = 1; i < n; i++) {
     let bit = n >> 1;
-    while (j & bit) { j ^= bit; bit >>= 1; }
+    while (j & bit) {
+      j ^= bit;
+      bit >>= 1;
+    }
     j ^= bit;
     if (i < j) {
       [re[i], re[j]] = [re[j], re[i]];
       [im[i], im[j]] = [im[j], im[i]];
     }
   }
+
   for (let len = 2; len <= n; len <<= 1) {
-    const ang = 2 * Math.PI / len * (invert ? -1 : 1);
+    const ang = (2 * Math.PI / len) * (invert ? -1 : 1);
     const wlenRe = Math.cos(ang);
     const wlenIm = Math.sin(ang);
+
     for (let i = 0; i < n; i += len) {
-      let wRe = 1, wIm = 0;
-      const half = len >> 1;
-      for (let j2 = 0; j2 < half; j2++) {
-        const uRe = re[i + j2];
-        const uIm = im[i + j2];
-        const vr = re[i + j2 + half];
-        const vi = im[i + j2 + half];
-        const vRe = vr * wRe - vi * wIm;
-        const vIm = vr * wIm + vi * wRe;
-        re[i + j2] = uRe + vRe;
-        im[i + j2] = uIm + vIm;
-        re[i + j2 + half] = uRe - vRe;
-        im[i + j2 + half] = uIm - vIm;
-        const nwRe = wRe * wlenRe - wIm * wlenIm;
-        const nwIm = wRe * wlenIm + wIm * wlenRe;
-        wRe = nwRe; wIm = nwIm;
+      let wRe = 1;
+      let wIm = 0;
+
+      for (let k = 0; k < len / 2; k++) {
+        const uRe = re[i + k];
+        const uIm = im[i + k];
+
+        const vRe = re[i + k + len / 2] * wRe - im[i + k + len / 2] * wIm;
+        const vIm = re[i + k + len / 2] * wIm + im[i + k + len / 2] * wRe;
+
+        re[i + k] = uRe + vRe;
+        im[i + k] = uIm + vIm;
+        re[i + k + len / 2] = uRe - vRe;
+        im[i + k + len / 2] = uIm - vIm;
+
+        const nextWRe = wRe * wlenRe - wIm * wlenIm;
+        const nextWIm = wRe * wlenIm + wIm * wlenRe;
+        wRe = nextWRe;
+        wIm = nextWIm;
       }
     }
   }
+
   if (invert) {
     for (let i = 0; i < n; i++) {
-      re[i] /= n; im[i] /= n;
+      re[i] /= n;
+      im[i] /= n;
     }
   }
 }
 
 function convolveFFT_real(a, b) {
-  const na = a.length, nb = b.length;
-  const outLen = na + nb - 1;
-  let n = 1; while (n < outLen) n <<= 1;
+  const outLen = a.length + b.length - 1;
+  let n = 1;
+  while (n < outLen) n <<= 1;
+
   const are = new Float64Array(n);
   const aim = new Float64Array(n);
   const bre = new Float64Array(n);
   const bim = new Float64Array(n);
-  are.set(a); bre.set(b);
+
+  are.set(a);
+  bre.set(b);
+
   fft_inplace(are, aim, false);
   fft_inplace(bre, bim, false);
+
   const cre = new Float64Array(n);
   const cim = new Float64Array(n);
+
   for (let i = 0; i < n; i++) {
     cre[i] = are[i] * bre[i] - aim[i] * bim[i];
     cim[i] = are[i] * bim[i] + aim[i] * bre[i];
   }
+
   fft_inplace(cre, cim, true);
   return cre.subarray(0, outLen);
+}
+
+function wrapAngle(x) {
+  const TWO_PI = 2 * Math.PI;
+  if (!Number.isFinite(x)) return 0;
+  x = x % TWO_PI;
+  if (x > Math.PI) x -= TWO_PI;
+  if (x < -Math.PI) x += TWO_PI;
+  return x;
+}
+
+function effusivity(k, rho, cp) {
+  const kk = Math.max(1e-12, k);
+  const rr = Math.max(1e-9, rho);
+  const cc = Math.max(1e-9, cp);
+  return Math.sqrt(kk * rr * cc);
 }
 
 export function simulationCore(params) {
   const dt = Math.max(1e-6, params.dt || 1e-3);
   const duration = Math.max(dt, params.duration || 5);
-  const steps = Math.max(1, Math.floor(duration / dt));
+  const steps = Math.max(1, Math.floor(duration / dt) + 1);
 
-  // Materialkonstanten
-  const rho = Number.isFinite(params.rho_disc) ? params.rho_disc : 7800; // kg/m3
-  const cp = Number.isFinite(params.cp_disc) ? params.cp_disc : 460;    // J/(kg K)
-  let k = Number.isFinite(params.k_disc) ? params.k_disc : 50;          // W/(m K)
-  if (k <= 0) k = 1e-12;
-  const alpha = k / (rho * cp);
-  const T0 = Number.isFinite(params.T0) ? params.T0 : 20; // °C
+  // --- Material Rad ---
+  const rho_w = Number.isFinite(params.rho_disc) ? Math.max(1e-9, params.rho_disc) : 7800;
+  const cp_w  = Number.isFinite(params.cp_disc)  ? Math.max(1e-9, params.cp_disc)  : 460;
+  const k_w   = Number.isFinite(params.k_disc)   ? Math.max(1e-12, params.k_disc)  : 50;
+  const alpha_w = k_w / (rho_w * cp_w);
 
-  // Rad / Szenario
-  const R = Number.isFinite(params.R) ? params.R : 0.3; // m
-  const scenario = params.scenario || "Constant Speed";
-  const initialFreq = Number.isFinite(params.wheelFrequency) ? params.wheelFrequency : 10; // Hz
-  const aNeg = Number.isFinite(params.aNeg) ? params.aNeg : -1; // m/s^2
-  const aPos = Number.isFinite(params.aPos) ? params.aPos : 2;  // m/s^2
-  const v_ref = Math.max(initialFreq, 1e-6) * 2 * Math.PI * R;
+  // --- Material Schiene ---
+  const rho_r = Number.isFinite(params.rho_rail) ? Math.max(1e-9, params.rho_rail) : rho_w;
+  const cp_r  = Number.isFinite(params.cp_rail)  ? Math.max(1e-9, params.cp_rail)  : cp_w;
+  const k_r   = Number.isFinite(params.k_rail)   ? Math.max(1e-12, params.k_rail)  : k_w;
 
-  // Kontakt-Geometrie
-  const contactAngle = 0.05;         // rad, Bremsklotzbreite in Rad
-  const contactDepth = 0.001;        // m, Eindringtiefe / Wärmetiefe (typisch sehr klein)
-  const contactArea = contactAngle * R * 1.0; // m^2 (1 m axial angenommen)
+  const T0_C = Number.isFinite(params.T0) ? params.T0 : 20;
 
-  // Edensity: jetzt INTERPRETIERT ALS J/m^2 (Energie pro Kontaktfläche)
-  // Benutzer-Parameter: params.Edensity [J/m^2]
-  const Edensity = Number.isFinite(params.Edensity) ? params.Edensity : 0.05; // J/m^2 default (sehr klein)
-  const E_absorb_base = Edensity * contactArea; // J per contact (bei speedScale = 1)
+  // Messabstand
+  const dist = Number.isFinite(params.distance) ? Math.max(0, params.distance) : 0.001;
+  const distSq = dist * dist;
 
-  // Effektives Volumen, das die Wärme initial aufnimmt (für Kühlung/Abkühlung)
-  // Standard: contactVolume = contactArea * contactDepth
-  const contactVolume = contactArea * contactDepth; // m^3
-  // Option: allow scaling the effective thermal volume (user can increase to model deeper spread)
-  const thermalVolumeFactor = Number.isFinite(params.thermalVolumeFactor) ? Math.max(1e-6, params.thermalVolumeFactor) : 1.0;
-  const V_effect = contactVolume * thermalVolumeFactor; // m^3
+  // Szenario
+  const scenario = typeof params.scenario === "string" ? params.scenario : "Constant Speed";
+  const aNeg = Number.isFinite(params.aNeg) ? params.aNeg : -0.8;
+  const aPos = Number.isFinite(params.aPos) ? params.aPos : 0.4;
+  const phi_obs = Number.isFinite(params.phi_obs) ? params.phi_obs : 0;
 
-  // Reib- / Brems-Parameter (mechanische Arbeit)
-  const mu_param = Number.isFinite(params.mu) ? Math.max(0, params.mu) : 0;
-  const FN_param = Number.isFinite(params.FN) ? Math.max(0, params.FN) : 0;
-  const slidingDistance = R * contactAngle; // m
-  const F_friction = mu_param * FN_param; // N
-  const E_mech_per_contact = F_friction * slidingDistance; // J per contact
-  const frictionToHeat = Number.isFinite(params.frictionToHeat) ? Math.max(0, Math.min(1, params.frictionToHeat)) : 1.0;
+  // Geometrie
+  const R = Number.isFinite(params.R) ? Math.max(1e-9, params.R) : 0.3;
 
-  // Kühlkoeffizient: kLoss interpretieren als Wärmeübergangskoeffizient h [W/(m^2 K)]
-  // Realistische Werte: natürliche Konvektion ~ 5..25, erzwungene Konvektion 10..200, Kontakt/Kühlkörper deutlich größer.
-  const h = Number.isFinite(params.kLoss) ? Math.max(0, params.kLoss) : 20; // W / (m^2 K)
+  // Bremsklotz-Geometrie
+  const padLength = Number.isFinite(params.padLength) ? Math.max(1e-6, params.padLength) : 0.05; // 50 mm
+  const maxPadLength = Math.PI * R;
+  const padLengthClamped = Math.min(padLength, maxPadLength);
 
-  // Rad-Trägheitsmoment: I_disc oder compute from wheelMass (solid disc)
-  let I_disc = Number.isFinite(params.I_disc) ? params.I_disc : null;
-  if (!I_disc) {
-    const wheelMass = Number.isFinite(params.wheelMass) ? params.wheelMass : 100; // kg
+  const contactAngle = padLengthClamped / R;
+  const contactArc   = Math.max(1e-12, padLengthClamped);
+
+  const padWidth = Number.isFinite(params.padWidth) ? Math.max(1e-6, params.padWidth) : 1.0;
+  const contactArea = padLengthClamped * padWidth;
+
+  const contactDepth = Number.isFinite(params.contactDepth)
+    ? Math.max(1e-6, params.contactDepth)
+    : 0.001;
+
+  const thermalVolumeFactor = Number.isFinite(params.thermalVolumeFactor)
+    ? Math.max(1e-6, params.thermalVolumeFactor)
+    : 1.0;
+
+  const V_effect = contactArea * contactDepth * thermalVolumeFactor;
+
+  // Rad-Trägheitsmoment
+  let I_disc = Number.isFinite(params.I_disc) ? Math.max(1e-12, params.I_disc) : NaN;
+  if (!Number.isFinite(I_disc)) {
+    const wheelMass = Number.isFinite(params.wheelMass) ? Math.max(1e-9, params.wheelMass) : 300;
     I_disc = 0.5 * wheelMass * R * R;
   }
 
-  // Pulse timing
-  const nBK = Math.max(1, Math.min(2, Number.isFinite(params.nBK) ? params.nBK : 1));
-  let bkAngles = nBK === 1 ? [0] : [0, Math.PI];
-  const phi_obs = Number.isFinite(params.phi_obs) ? params.phi_obs : 0;
-  bkAngles = bkAngles.map(a => ((a - phi_obs) + 2 * Math.PI) % (2 * Math.PI));
-  const nextPulse = bkAngles.map(a => a);
+  // --- Zug / Adhäsion (intern, keine Slider nötig) ---
+  const g = 9.81;
+  const mTrain = Number.isFinite(params.trainMass) ? Math.max(1, params.trainMass) : 40000; // kg
+  const muAdh  = Number.isFinite(params.muAdh) ? Math.max(0, params.muAdh) : 0.15;
+  const nDrivenWheels = Number.isFinite(params.nDrivenWheels)
+    ? Math.max(1, Math.floor(params.nDrivenWheels))
+    : 8;
 
-  const dist = Number.isFinite(params.distance) ? params.distance : 0.001;
-  const distSq = dist * dist;
+  const mEff = mTrain / nDrivenWheels;
+  const I_eff = I_disc + mEff * R * R;
 
-  // Buffers
-  const pulseSeq = new Float64Array(steps);     // Leistung W pro timestep, wird an Kernel gefaltet
-  const velocityProfile = new Float64Array(steps);
+  const FdriveMax = muAdh * mEff * g;
+  const tauDriveMax = FdriveMax * R;
 
   // Startbedingungen
-  let freq = (scenario === "Acceleration with Brake") ? 0 : initialFreq;
-  let omega = 2 * Math.PI * freq;
-  let cumAngle = 0;
+  const hasV0 = Number.isFinite(params.v0);
+  const v0 = hasV0 ? Math.max(0, params.v0) : null;
+  const wheelFrequency = Number.isFinite(params.wheelFrequency)
+    ? Math.max(0, params.wheelFrequency)
+    : 12;
 
-  // Simulation loop
+  let omega = hasV0 ? v0 / R : 2 * Math.PI * wheelFrequency;
+  if (scenario === "Acceleration with Brake" && !hasV0) omega = 0;
+  let v_mps = omega * R;
+
+  // Bremsen (Pad-Rad)
+  const nBK = Number.isFinite(params.nBK) ? Math.max(0, Math.floor(params.nBK)) : 1;
+  const bkAngles = Array.isArray(params.bkAngles) ? params.bkAngles : [0];
+
+  const mu = Number.isFinite(params.mu) ? Math.max(0, params.mu) : 0.4;
+  const FN = Number.isFinite(params.FN) ? Math.max(0, params.FN) : 3000;
+  const mu_s = Number.isFinite(params.mu_s) ? Math.max(mu, params.mu_s) : mu;
+
+  const frictionToHeat = Number.isFinite(params.frictionToHeat)
+    ? Math.max(0, Math.min(1, params.frictionToHeat))
+    : 0.9;
+
+  // Zusatzenergie pro Fläche (J/m²)
+  const Edensity = Number.isFinite(params.Edensity) ? Math.max(0, params.Edensity) : 0;
+
+  // Singularitätsfix: Quellradius ~ L/4
+  const sourceRadius = Number.isFinite(params.sourceRadius)
+    ? Math.max(0, params.sourceRadius)
+    : Math.max(1e-6, padLengthClamped / 4);
+
+  const rEffSq = distSq + sourceRadius * sourceRadius;
+
+  // 2-Körper-Split
+  let heatSplitWheel = Number.isFinite(params.heatSplitWheel)
+    ? Math.max(0, Math.min(1, params.heatSplitWheel))
+    : NaN;
+
+  if (!Number.isFinite(heatSplitWheel)) {
+    const e_w = effusivity(k_w, rho_w, cp_w);
+    const e_r = effusivity(k_r, rho_r, cp_r);
+    heatSplitWheel = e_w / (e_w + e_r);
+    if (!Number.isFinite(heatSplitWheel)) heatSplitWheel = 0.5;
+  }
+  const heatSplitRail = 1 - heatSplitWheel;
+
+  // Verlust (kLoss) als Kernel-Dämpfung
+  const h_loss = Number.isFinite(params.kLoss) ? Math.max(0, params.kLoss) : 200;
+  const Cw_local = Math.max(1e-12, rho_w * cp_w * V_effect);
+  const lambdaLoss = (h_loss * contactArea) / Cw_local;
+
+  // Halbraum-Faktor (Oberfläche)
+  const surfaceFactor = 2;
+
+  // Buffers
+  const pulseWheelSeq = new Float64Array(steps);
+  const pulseRailSeq  = new Float64Array(steps);
+  const velocityProfile = new Float64Array(steps);
+
+  let theta = 0;
+  const omegaEps = 1e-6;
+
+  const NsubBase = 8;
+  const tauFromAccel = (aCmd) => I_eff * (aCmd / R);
+
   for (let i = 0; i < steps; i++) {
-    // Szenario: kontinuierliche Beschleunigung/Verzögerung
-    if (scenario === "Emergency Brake") {
-      const alpha_cont = aNeg / R; // rad/s^2 (neg)
-      omega = Math.max(0, omega + alpha_cont * dt);
-      freq = omega / (2 * Math.PI);
-    } else if (scenario === "Acceleration with Brake") {
-      const alpha_drive = aPos / R;
-      omega = Math.max(0, omega + alpha_drive * dt);
-      freq = omega / (2 * Math.PI);
-    } else {
-      // Constant Speed: erzwinge exakt initialFreq (kein numerischer Drift)
-      freq = initialFreq;
-      omega = 2 * Math.PI * initialFreq;
-    }
+    const dThetaStepEst = Math.abs(omega * dt);
+    const Nsub = Math.max(
+      NsubBase,
+      Math.ceil(dThetaStepEst / Math.max(1e-12, contactAngle * 0.25))
+    );
+    const dtSub = dt / Nsub;
 
-    const v_mps = omega * R;
-    velocityProfile[i] = v_mps;
+    for (let s = 0; s < Nsub; s++) {
+      let tauBrakeKinetic = 0;
+      let tauBrakeStaticMax = 0;
+      let inAnyContact = false;
 
-    const dAngle = freq * 2 * Math.PI * dt;
-    const prevAngle = cumAngle;
-    cumAngle += dAngle;
+      const thetaWrapped = wrapAngle(theta);
 
-    // Kontakt-Events
-    for (let j = 0; j < nBK; j++) {
-      while (nextPulse[j] <= prevAngle) nextPulse[j] += 2 * Math.PI;
-      if (prevAngle < nextPulse[j] && nextPulse[j] <= cumAngle) {
-        // mechanische Bremsarbeit pro Kontakt (J)
-        const E_brake_mech = E_mech_per_contact;
+      for (let j = 0; j < nBK; j++) {
+        const bAngle = Number.isFinite(bkAngles[j]) ? bkAngles[j] : 0;
+        const d = wrapAngle(thetaWrapped - wrapAngle(bAngle));
+        const inContact = Math.abs(d) <= contactAngle * 0.5;
+        if (!inContact) continue;
 
-        // thermischer Anteil aus Reibung + Materialabsorption (Edensity per contact area)
-        let speedScale = v_mps / (v_ref || 1e-9);
-        if (!isFinite(speedScale) || speedScale < 0) speedScale = 0;
-        const E_absorb = E_absorb_base * speedScale; // J per contact from material absorption (speed dependent)
-        const E_heat_from_friction = frictionToHeat * E_brake_mech; // J from friction -> heat
-        const E_pulse_thermal = E_absorb + E_heat_from_friction; // total J per contact into local thermal zone
+        inAnyContact = true;
+        tauBrakeKinetic += mu * FN * R;
+        tauBrakeStaticMax += mu_s * FN * R;
+      }
 
-        if (E_pulse_thermal > 0) {
-          // convert to power for this timestep: W = J / dt
-          pulseSeq[i] += E_pulse_thermal / dt;
+      // τ_drive vor Adhäsionslimit
+      let tauDriveTarget = 0;
+
+      if (scenario === "Constant Speed") {
+        tauDriveTarget = inAnyContact ? tauBrakeKinetic : 0;
+      } else if (scenario === "Emergency Brake") {
+        tauDriveTarget = tauFromAccel(3 * aNeg); // aNeg < 0
+      } else if (scenario === "Braking") {
+        tauDriveTarget = tauFromAccel(aNeg);
+      } else if (scenario === "Acceleration") {
+        tauDriveTarget = tauFromAccel(aPos);
+      } else if (scenario === "Acceleration with Brake") {
+        tauDriveTarget = tauFromAccel(aPos) + (inAnyContact ? tauBrakeKinetic : 0);
+      }
+
+      // Adhäsionslimit: nur positives Antriebsmoment begrenzen
+      let tauDrive = tauDriveTarget;
+      if (tauDrive > tauDriveMax) tauDrive = tauDriveMax;
+
+      // Haftreibung (nicht für "Acceleration with Brake")
+      if (
+        scenario !== "Acceleration with Brake" &&
+        inAnyContact &&
+        Math.abs(omega) < omegaEps
+      ) {
+        const tauDrivePos = Math.max(0, tauDrive);
+        if (tauDrivePos <= tauBrakeStaticMax) {
+          omega = 0;
+          v_mps = 0;
+          continue;
         }
+      }
 
-        // nur Energieentzug wenn nicht ConstantSpeed (Motor kompensiert sonst)
-        if (scenario !== "Constant Speed") {
-          const Ek_rot = 0.5 * I_disc * omega * omega;
-          const Ek_new = Math.max(0, Ek_rot - E_brake_mech);
-          omega = Ek_new > 0 ? Math.sqrt(2 * Ek_new / I_disc) : 0;
-          freq = omega / (2 * Math.PI);
-          velocityProfile[i] = omega * R;
-        }
+      const tauBrake = inAnyContact ? tauBrakeKinetic : 0;
+      const tauNet = tauDrive - tauBrake;
+      const alphaRot = tauNet / I_eff;
 
-        nextPulse[j] += 2 * Math.PI;
+      theta = theta + omega * dtSub + 0.5 * alphaRot * dtSub * dtSub;
+
+      omega = omega + alphaRot * dtSub;
+      if (omega < 0) omega = 0;
+      v_mps = omega * R;
+
+      if (inAnyContact && omega > omegaEps) {
+        const P_fric = tauBrake * omega;
+        const dE_heat_total = frictionToHeat * P_fric * dtSub;
+
+        const slipDist = v_mps * dtSub;
+        const frac = Math.max(0, Math.min(1, slipDist / contactArc));
+        const dE_absorb_total = Edensity * contactArea * frac;
+
+        const dE_total = dE_heat_total + dE_absorb_total;
+
+        pulseWheelSeq[i] += heatSplitWheel * dE_total;
+        pulseRailSeq[i]  += heatSplitRail  * dE_total;
       }
     }
+
+    velocityProfile[i] = v_mps;
   }
 
-  // Green's kernel (simple 3D point-like kernel)
+  const powerSeq = new Float64Array(steps);
+  for (let i = 0; i < steps; i++) powerSeq[i] = pulseWheelSeq[i] / dt;
+
+  // Green-Kernel
   const kernel = new Float64Array(steps);
   for (let i = 0; i < steps; i++) {
-    const tau = (i === 0) ? dt * 0.5 : i * dt;
-    const denom = Math.pow(4 * Math.PI * alpha * tau, 1.5);
-    kernel[i] = (denom > 0)
-      ? Math.exp(-distSq / (4 * alpha * tau)) / (denom * rho * cp)
-      : 0;
+    const tau = (i + 0.5) * dt;
+    const denom = Math.pow(4 * Math.PI * alpha_w * tau, 1.5);
+    const G =
+      denom > 0
+        ? Math.exp(-rEffSq / (4 * alpha_w * tau)) / (denom * rho_w * cp_w)
+        : 0;
+
+    kernel[i] = surfaceFactor * G * Math.exp(-lambdaLoss * tau);
   }
 
-  // Convolution: pulseSeq (W) * kernel -> delta-T (K) time series
-  let conv = convolveFFT_real(pulseSeq, kernel);
+  const conv = convolveFFT_real(pulseWheelSeq, kernel);
 
-  // Kühlung: realistische Newton'sche Abkühlung auf das effektive Volumen V_effect
-  // Wärmestrom q = h * A * (T - T0) -> Temperaturabfallrate dT/dt = - q / (m*cp) = - h*A/(rho*V*cp) * (T - T0)
-  // => Lösung über dt: T(t+dt) = T0 + (T(t)-T0) * exp(-h*A/(rho*V*cp) * dt)
-  const area_cool = contactArea; // Fläche für Wärmeabgabe (angepasst falls nötig)
-  const coolingFactorPerSec = (h * area_cool) / (rho * V_effect * cp); // 1/s
-  for (let i = 0; i < steps; i++) {
-    let temp = T0 + conv[i]; // absolute T
-    // exponential decay for stability
-    temp = T0 + (temp - T0) * Math.exp(-coolingFactorPerSec * dt);
-    conv[i] = temp - T0; // store delta-T
-  }
-
-  // ----- Stabiles Resampling für Ausgabe -----
-  const maxPoints = Math.max(2, Math.min(5000, Number.isFinite(params.maxPoints) ? params.maxPoints : 500));
+  const maxPoints = Math.max(
+    2,
+    Math.min(5000, Number.isFinite(params.maxPoints) ? params.maxPoints : 500)
+  );
   const Nout = Math.min(maxPoints, steps);
 
   const sampleAt = (arr, tIndexFloat) => {
@@ -238,27 +372,29 @@ export function simulationCore(params) {
 
   const out = [];
   for (let i = 0; i < Nout; i++) {
-    const tFrac = (Nout === 1) ? 0 : (i / (Nout - 1));
+    const tFrac = Nout === 1 ? 0 : i / (Nout - 1);
     const tIndexFloat = tFrac * (steps - 1);
     const time = tFrac * duration;
-    const pointTemp = T0 + sampleAt(conv, tIndexFloat);
-    const cumulativeEnergy = (() => {
+
+    const pointTemp = T0_C + sampleAt(conv, tIndexFloat);
+
+    const cumulativeEnergyWheel = (() => {
       const idx = Math.floor(tIndexFloat);
       let sum = 0;
-      for (let j = 0; j <= idx; j++) sum += pulseSeq[j] * dt;
+      for (let j = 0; j <= idx; j++) sum += pulseWheelSeq[j];
       const frac = tIndexFloat - idx;
-      if (idx + 1 < pulseSeq.length) sum += pulseSeq[idx + 1] * dt * frac;
+      if (idx + 1 < pulseWheelSeq.length) sum += pulseWheelSeq[idx + 1] * frac;
       return sum;
     })();
-    const power = sampleAt(pulseSeq, tIndexFloat);
-    const velocity = sampleAt(velocityProfile, tIndexFloat);
 
     out.push({
       time,
       pointTemp,
-      cumulativeEnergy,
-      power,
-      velocity
+      cumulativeEnergy: cumulativeEnergyWheel,
+      power: sampleAt(powerSeq, tIndexFloat),
+      velocity: sampleAt(velocityProfile, tIndexFloat),
+      phi_obs
+      // (Debug-Infos kannst du hier bei Bedarf wieder ergänzen)
     });
   }
 

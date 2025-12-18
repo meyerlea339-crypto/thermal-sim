@@ -23,46 +23,55 @@ const DEFAULT_PARAMS = {
   scenario: "Constant Speed",
   dt: 0.001,
   duration: 15,
+
   wheelFrequency: 12,
-  aNeg: -2.5,
-  aPos: 2.0,
+
+  aNeg: -0.8,
+  aPos: 0.4,
+
+  trainMass: 40000, // kg
+
+  padLength: 0.05, // m
+
   Edensity: 50,
   thermalVolumeFactor: 1.0,
+
   k_disc: 50,
   rho_disc: 7800,
   cp_disc: 460,
-  kLoss: 50,
+
+  kLoss: 200,
+
   distance: 0.001,
+
   nBK: 1,
   bkAngles: [0, Math.PI],
+
   R: 0.3,
+
   mu: 0.4,
   FN: 3000,
+
   frictionToHeat: 0.9,
-  wheelMass: 200,
+  wheelMass: 300,
+
   maxPoints: 500,
   T0: 20
 };
 
-/* Bildschirmgröße für spätere UI-Anpassungen (falls benötigt) */
 function useDisplaySize() {
   const [size, setSize] = useState({ width: 0, height: 0 });
-
   useLayoutEffect(() => {
     if (typeof window === "undefined") return;
-
-    const measure = () => {
+    const measure = () =>
       setSize({
         width: window.innerWidth,
         height: window.innerHeight
       });
-    };
-
     measure();
     window.addEventListener("resize", measure);
     return () => window.removeEventListener("resize", measure);
   }, []);
-
   return size;
 }
 
@@ -73,18 +82,20 @@ export default function SimulationPage() {
   const updateParam = (key, value) =>
     setParams(prev => ({ ...prev, [key]: value }));
 
-  // velocity in km/h
   const chartData = Array.isArray(data)
     ? data.map(d => ({
         ...d,
-        velocity:
-          Number.isFinite(d.velocity) ? d.velocity * 3.6 : d.velocity
+        // m/s -> km/h
+        velocity: Number.isFinite(d.velocity)
+          ? d.velocity * 3.6
+          : d.velocity
       }))
     : [];
 
+  useDisplaySize();
+
   return (
     <div className="flex h-screen w-screen bg-slate-950 text-slate-200 overflow-hidden font-sans">
-      {/* Sidebar jetzt breiter */}
       <aside className="w-80 flex-none border-r border-slate-800 bg-slate-900 overflow-y-auto p-4">
         <div className="flex items-center gap-2 mb-6 text-blue-400">
           <Settings2 className="w-6 h-6" />
@@ -104,20 +115,138 @@ export default function SimulationPage() {
         </Section>
 
         <Section title="System Constants">
-          <InputGroup label="Duration [s]" value={params.duration} onChange={(v) => updateParam("duration", v)} min={1} max={120} step={0.5} />
-          <InputGroup label="dt [s]" value={params.dt} onChange={(v) => updateParam("dt", v)} min={1e-6} max={0.01} step={1e-6} scientific />
-          <InputGroup label="Distance [m]" value={params.distance} onChange={(v) => updateParam("distance", v)} min={0} max={0.02} step={0.0001} />
-          <InputGroup label="Thermal k [W/mK]" value={params.k_disc} onChange={(v) => updateParam("k_disc", v)} min={1} max={200} step={1} />
-          <InputGroup label="Energie pro Kontaktfläche [J/m²]" value={params.Edensity} onChange={(v) => updateParam("Edensity", v)} min={0} max={1000} step={1} />
-          <InputGroup label="Wheel Freq [Hz]" value={params.wheelFrequency} onChange={(v) => updateParam("wheelFrequency", v)} min={0} max={50} step={0.5} />
-          <InputGroup label="mu" value={params.mu} onChange={(v) => updateParam("mu", v)} min={0} max={2} step={0.01} />
-          <InputGroup label="FN [N]" value={params.FN} onChange={(v) => updateParam("FN", v)} min={0} max={50000} step={10} />
-          <InputGroup label="Bremsklötze" value={params.nBK} onChange={(v) => updateParam("nBK", Math.max(1, Math.min(2, v)))} min={1} max={2} step={1} />
-          <InputGroup label="Wärmeübergang h [W/m²K]" value={params.kLoss} onChange={(v) => updateParam("kLoss", v)} min={0} max={2000} step={1} />
+          <InputGroup
+            label="Duration [s]"
+            value={params.duration}
+            onChange={(v) => updateParam("duration", v)}
+            min={1}
+            max={120}
+            step={0.5}
+          />
+          <InputGroup
+            label="dt [s]"
+            value={params.dt}
+            onChange={(v) => updateParam("dt", v)}
+            min={1e-6}
+            max={0.01}
+            step={1e-6}
+            scientific
+          />
+          <InputGroup
+            label="Wheel Freq [Hz]"
+            value={params.wheelFrequency}
+            onChange={(v) => updateParam("wheelFrequency", v)}
+            min={0}
+            max={50}
+            step={0.5}
+          />
+
+          <InputGroup
+            label="aPos (command) [m/s²]"
+            value={params.aPos}
+            onChange={(v) => updateParam("aPos", v)}
+            min={0}
+            max={2.0}
+            step={0.01}
+          />
+          <InputGroup
+            label="aNeg [m/s²]"
+            value={params.aNeg}
+            onChange={(v) => updateParam("aNeg", v)}
+            min={-5}
+            max={0}
+            step={0.01}
+          />
+
+          <InputGroup
+            label="Train mass [kg]"
+            value={params.trainMass}
+            onChange={(v) => updateParam("trainMass", v)}
+            min={5000}
+            max={300000}
+            step={1000}
+          />
+
+          <InputGroup
+            label="Pad length [mm]"
+            value={params.padLength * 1000}
+            onChange={(mm) => updateParam("padLength", mm / 1000)}
+            min={5}
+            max={200}
+            step={1}
+          />
+
+          <InputGroup
+            label="Distance [m]"
+            value={params.distance}
+            onChange={(v) => updateParam("distance", v)}
+            min={0}
+            max={0.02}
+            step={0.0001}
+          />
+          <InputGroup
+            label="Thermal k [W/mK]"
+            value={params.k_disc}
+            onChange={(v) => updateParam("k_disc", v)}
+            min={1}
+            max={200}
+            step={1}
+          />
+          <InputGroup
+            label="Energy per unit contact area [J/m²]"
+            value={params.Edensity}
+            onChange={(v) => updateParam("Edensity", v)}
+            min={0}
+            max={1000}
+            step={1}
+          />
+
+          <InputGroup
+            label="mu (pad-wheel)"
+            value={params.mu}
+            onChange={(v) => updateParam("mu", v)}
+            min={0}
+            max={2}
+            step={0.01}
+          />
+          <InputGroup
+            label="FN [N]"
+            value={params.FN}
+            onChange={(v) => updateParam("FN", v)}
+            min={0}
+            max={50000}
+            step={10}
+          />
+          <InputGroup
+            label="Brake pads"
+            value={params.nBK}
+            onChange={(v) =>
+              updateParam("nBK", Math.max(1, Math.min(2, v)))
+            }
+            min={1}
+            max={2}
+            step={1}
+          />
+          <InputGroup
+            label="Heat transfer h [W/m²K]"
+            value={params.kLoss}
+            onChange={(v) => updateParam("kLoss", v)}
+            min={0}
+            max={2000}
+            step={1}
+          />
+
+          <InputGroup
+            label="maxPoints (plot)"
+            value={params.maxPoints}
+            onChange={(v) => updateParam("maxPoints", v)}
+            min={200}
+            max={5000}
+            step={100}
+          />
         </Section>
       </aside>
 
-      {/* Chartbereich — füllt den Rest komplett aus */}
       <main className="flex-1 p-4 overflow-hidden min-h-0 min-w-0 h-full">
         <div className="grid grid-cols-2 grid-rows-2 gap-6 h-full">
           <Chart
@@ -151,7 +280,8 @@ export default function SimulationPage() {
             dataKey="velocity"
             stroke="#10b981"
             data={chartData}
-            domainAuto
+            clampLowerToZero
+            // KEIN domainAuto hier
           />
         </div>
       </main>
@@ -159,7 +289,7 @@ export default function SimulationPage() {
   );
 }
 
-/* ---------- UI Hilfs-Komponenten ---------- */
+/* ---------- UI-Helfer ---------- */
 
 function Section({ title, children }) {
   return (
@@ -207,14 +337,14 @@ function InputGroup({
           value={safe}
           step={step}
           onChange={(e) => onChange(parseFloat(e.target.value))}
-          className="w-20 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs text-right"
+          className="w-24 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs text-right"
         />
       </div>
     </div>
   );
 }
 
-/* ---------- Chart-Komponente ---------- */
+/* ---------- Chart-Komponente (hier ist der eigentliche Fix) ---------- */
 
 function Chart({
   title,
@@ -226,7 +356,6 @@ function Chart({
   clampLowerToZero = false,
   domainAuto = false
 }) {
-  // Sortieren nach time
   const safeData = Array.isArray(data)
     ? [...data].sort((a, b) => (a.time || 0) - (b.time || 0))
     : [];
@@ -236,7 +365,6 @@ function Chart({
     : 1;
   const xDomain = [0, xMax];
 
-  // Y-Achse
   const vals = safeData
     .map((d) => Number(d[dataKey]))
     .filter(Number.isFinite);
@@ -250,14 +378,31 @@ function Chart({
     yMax += eps;
   }
 
-  const pad = (yMax - yMin) * 0.1;
+  const range = yMax - yMin;
+  const relSpan = yMax !== 0 ? range / Math.abs(yMax) : 0;
+
+  const pad = range * 0.1;
   let lower = yMin - pad;
   let upper = yMax + pad;
 
   if (clampLowerToZero) lower = Math.max(0, lower);
-  if (upper <= lower) upper = lower + Math.abs(lower) * 0.02;
 
-  const yDomain = [lower, upper];
+  // Speziell für Velocity: wenn die Spanne winzig ist, auf 0...vmax*1.1 skalieren
+  if (dataKey === "velocity" && vals.length) {
+    const vmax = yMax;
+    lower = 0;
+    upper = vmax > 0 ? vmax * 1.1 : 1;
+  } else if (relSpan < 1e-4 && vals.length) {
+    // generischer Schutz: falls Range extrem klein, etwas Luft geben
+    const center = 0.5 * (yMin + yMax);
+    const span = Math.max(Math.abs(center) * 0.05, 1); // ±5% oder mindestens 1
+    lower = center - span;
+    upper = center + span;
+  }
+
+  if (upper <= lower) upper = lower + Math.abs(lower) * 0.02 || 1;
+
+  const yDomain = domainAuto ? ["auto", "auto"] : [lower, upper];
 
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden flex flex-col w-full h-full">
@@ -286,7 +431,7 @@ function Chart({
               tickMargin={8}
             />
             <YAxis
-              domain={domainAuto ? ["auto", "auto"] : yDomain}
+              domain={yDomain}
               stroke="#94a3b8"
               fontSize={12}
               tickFormatter={(v) =>
@@ -298,11 +443,7 @@ function Chart({
                 Number.isFinite(v) ? Number(v.toFixed(6)) : v
               }
             />
-            <Legend
-              verticalAlign="top"
-              align="right"
-              height={28}
-            />
+            <Legend verticalAlign="top" align="right" height={28} />
             <Line
               type={type}
               dataKey={dataKey}
