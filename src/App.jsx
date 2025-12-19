@@ -1,5 +1,9 @@
-import SimulationPage from './SimulationPage';
+// App.jsx
+import React from "react";
+import SimulationPage from "./SimulationPage";
 
-export default function App() {
+function App() {
   return <SimulationPage />;
 }
+
+export default App;

@@ -19,30 +19,31 @@ import {
   BatteryCharging
 } from "lucide-react";
 
+/**
+ * dt ist hier fest (numerischer Zeitschritt), kein Slider.
+ */
 const DEFAULT_PARAMS = {
   scenario: "Constant Speed",
-  dt: 0.001,
   duration: 15,
   wheelFrequency: 12,
-  // aNeg / aPos intern fest in simulationCore, hier nicht mehr nötig
   thermalVolumeFactor: 1.0,
   k_disc: 50,
   rho_disc: 7800,
   cp_disc: 460,
-  kLoss: 50,          // Heat transfer / Verlustfaktor
-  distance: 0.001,    // Beobachtungspunkt-Abstand
+  kLoss: 50,          // effektiver Wärmeverlust [W/m²K] im Kernel
+  distance: 0.001,    // radialer Abstand / Tiefe des Messpunkts [m]
   nBK: 1,             // Anzahl Bremsklötze
   bkAngles: [0, Math.PI],
-  R: 0.3,             // Radradius
-  mu: 0.4,            // Reibkoeff. Pad-Rad
-  FN: 3000,           // Gesamtnormalkraft des Bremssystems [N]
+  R: 0.3,             // Radradius [m]
+  mu: 0.4,            // Reibkoeffizient Pad–Rad
+  FN: 3000,           // gesamte Normalkraft des Bremssystems [N]
   frictionToHeat: 0.9,
   wheelMass: 200,
   maxPoints: 500,
   T0: 20
 };
 
-/* Bildschirmgröße für spätere UI-Anpassungen (falls benötigt) */
+/* Bildschirmgröße (falls du später responsive Logik brauchst) */
 function useDisplaySize() {
   const [size, setSize] = useState({ width: 0, height: 0 });
 
@@ -72,13 +73,21 @@ export default function SimulationPage() {
     setParams(prev => ({ ...prev, [key]: value }));
 
   // velocity in km/h
-  const chartData = Array.isArray(data)
-    ? data.map(d => ({
+const chartData = Array.isArray(data)
+  ? data.map((d) => {
+      const v_mps = Number.isFinite(d.velocity) ? d.velocity : NaN;
+      const v_kmh = Number.isFinite(v_mps) ? v_mps * 3.6 : NaN;
+      const v_rounded = Number.isFinite(v_kmh)
+        ? Math.round(v_kmh * 100) / 100   // zwei Nachkommastellen
+        : v_kmh;
+
+      return {
         ...d,
-        velocity:
-          Number.isFinite(d.velocity) ? d.velocity * 3.6 : d.velocity
-      }))
-    : [];
+        velocity: v_rounded,
+      };
+    })
+  : [];
+
 
   return (
     <div className="flex h-screen w-screen bg-slate-950 text-slate-200 overflow-hidden font-sans">
@@ -109,15 +118,6 @@ export default function SimulationPage() {
             min={1}
             max={120}
             step={0.5}
-          />
-          <InputGroup
-            label="dt [s]"
-            value={params.dt}
-            onChange={(v) => updateParam("dt", v)}
-            min={1e-6}
-            max={0.01}
-            step={1e-6}
-            scientific
           />
           <InputGroup
             label="Distance from contact [m]"
@@ -162,7 +162,9 @@ export default function SimulationPage() {
           <InputGroup
             label="Brake pads (1–2)"
             value={params.nBK}
-            onChange={(v) => updateParam("nBK", Math.max(1, Math.min(2, v)))}
+            onChange={(v) =>
+              updateParam("nBK", Math.max(1, Math.min(2, v)))
+            }
             min={1}
             max={2}
             step={1}
@@ -212,8 +214,10 @@ export default function SimulationPage() {
             dataKey="velocity"
             stroke="#10b981"
             data={chartData}
-            domainAuto
+             // domainAuto weg!
+            clampLowerToZero
           />
+
         </div>
       </main>
     </div>
@@ -303,15 +307,20 @@ function Chart({
   let yMin = vals.length ? Math.min(...vals) : 0;
   let yMax = vals.length ? Math.max(...vals) : 1;
 
-  if (yMin === yMax) {
-    const eps = Math.abs(yMin) * 0.02 || 1;
-    yMin -= eps;
-    yMax += eps;
-  }
+  let span = yMax - yMin;
 
-  const pad = (yMax - yMin) * 0.1;
-  let lower = yMin - pad;
-  let upper = yMax + pad;
+// falls quasi konstant → künstlich vernünftigen Bereich erzwingen
+if (span < 1e-3) {
+  const center = 0.5 * (yMax + yMin);
+  span = Math.max(1, Math.abs(center) * 0.1); // mind. 1 Einheit
+  yMin = center - span / 2;
+  yMax = center + span / 2;
+}
+
+const pad = 0.1 * span;
+let lower = yMin - pad;
+let upper = yMax + pad;
+
 
   if (clampLowerToZero) lower = Math.max(0, lower);
   if (upper <= lower) upper = lower + Math.abs(lower) * 0.02;

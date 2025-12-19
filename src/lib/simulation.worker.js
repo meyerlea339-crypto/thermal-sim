@@ -1,16 +1,16 @@
-/* eslint-disable no-restricted-globals */
-import { simulationCore } from "./simulationCore.js";
+// simulation.worker.js
+import { simulationCore } from "./simulationCore";
 
-self.onmessage = (event) => {
-  const params = event.data;
-
+self.onmessage = (e) => {
   try {
+    // Hook schickt direkt die params:
+    const params = e.data || {};
     const result = simulationCore(params);
-
-    // Nur gültige Arrays an den Main Thread schicken
-    postMessage(Array.isArray(result) ? result : []);
+    // Hook erwartet direkt ein Array als Nachricht:
+    self.postMessage(result);
   } catch (err) {
-    // Keine console.log hier nötig – Browser worker Konsole bleibt klein
-    postMessage([]);
+    console.error("Simulation worker error:", err);
+    // Im Fehlerfall leeres Array senden:
+    self.postMessage([]);
   }
 };
